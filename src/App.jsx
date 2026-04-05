@@ -19,6 +19,7 @@ const TOOL_COMPONENTS = {
     watermark: Watermark,
     utilities: Utilities,
 };
+//Main Function
 
 function App() {
     const [activeTool, setActiveTool] = useState('pdf');
