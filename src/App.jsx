@@ -9,8 +9,10 @@ import CompressImage from './tools/CompressImage';
 import ImageToPdf from './tools/ImageToPdf';
 import Watermark from './tools/Watermark';
 import Utilities from './tools/Utilities';
+import PdfWord from './tools/PdfWord';
 
 const TOOL_COMPONENTS = {
+    pdfword: PdfWord,
     pdf: PdfToImage,
     convert: ConvertFormat,
     resize: ResizeImage,
@@ -22,9 +24,9 @@ const TOOL_COMPONENTS = {
 //Main Function
 
 function App() {
-    const [activeTool, setActiveTool] = useState('pdf');
+    const [activeTool, setActiveTool] = useState('pdfword');
 
-    const ActiveComponent = TOOL_COMPONENTS[activeTool] || PdfToImage;
+    const ActiveComponent = TOOL_COMPONENTS[activeTool] || PdfWord;
 
     return (
         <div className="flex h-screen overflow-hidden bg-bg text-text">

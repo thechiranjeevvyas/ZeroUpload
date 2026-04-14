@@ -1,9 +1,10 @@
 import {
     FileText, Repeat, Maximize,
-    Minimize, Image as ImageIcon, Droplet, Wrench
+    Minimize, Image as ImageIcon, Droplet, Wrench, FileEdit
 } from 'lucide-react';
 
 const TOOLS = [
+    { id: 'pdfword', label: 'PDF & Word', icon: FileEdit },
     { id: 'pdf', label: 'PDF to Image', icon: FileText },
     { id: 'convert', label: 'Convert Format', icon: Repeat },
     { id: 'resize', label: 'Resize Image', icon: Maximize },
