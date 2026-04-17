@@ -10,9 +10,11 @@ import ImageToPdf from './tools/ImageToPdf';
 import Watermark from './tools/Watermark';
 import Utilities from './tools/Utilities';
 import PdfWord from './tools/PdfWord';
+import MergePdfs from './tools/MergePdfs';
 
 const TOOL_COMPONENTS = {
     pdfword: PdfWord,
+    mergepdf: MergePdfs,
     pdf: PdfToImage,
     convert: ConvertFormat,
     resize: ResizeImage,
