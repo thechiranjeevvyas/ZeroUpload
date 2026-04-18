@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, FileText, Download, RefreshCw, AlertCircle, FileEdit, CheckCircle } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
+import { PDFDocument } from 'pdf-lib';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import mammoth from 'mammoth';
@@ -14,7 +15,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 ).toString();
 
 const PdfWord = () => {
-    const [mode, setMode] = useState('pdf2word'); // 'pdf2word' or 'word2pdf'
+    const [mode, setMode] = useState('pdf2word'); // 'pdf2word', 'word2pdf', or 'compress'
     
     // State
     const [file, setFile] = useState(null);
@@ -24,16 +25,16 @@ const PdfWord = () => {
     const [progressLabel, setProgressLabel] = useState('');
     
     const [apiKey, setApiKey] = useState(() => localStorage.getItem('cloudconvert_api_key') || '');
-    
     const previewRef = useRef(null);
+
+    // Compress State
+    const [compressionLevel, setCompressionLevel] = useState(0); // 0: Normal, 1: Moderate, 2: Strict
+    const [fileMetadata, setFileMetadata] = useState(null); // { name, numPages, size }
+    const [compressResult, setCompressResult] = useState(null); // { originalSize, finalSize, spaceSaved, level }
 
     // Reset state on mode change
     useEffect(() => {
-        setFile(null);
-        setPreviewContent(null);
-        setIsProcessing(false);
-        setProgress(0);
-        setProgressLabel('');
+        resetTool();
     }, [mode]);
 
     const handleApiKeyChange = (e) => {
@@ -49,6 +50,8 @@ const PdfWord = () => {
         setFile(selectedFile);
         setPreviewContent(null);
         setProgress(0);
+        setCompressResult(null);
+        setCompressionLevel(0);
         
         if (mode === 'pdf2word') {
             if (selectedFile.type !== 'application/pdf') {
@@ -56,7 +59,26 @@ const PdfWord = () => {
                 setFile(null);
                 return;
             }
-            // For pdf2word, we wait for user to click convert.
+        } else if (mode === 'compress') {
+            if (selectedFile.type !== 'application/pdf') {
+                toast.error('Please upload a valid PDF file.');
+                setFile(null);
+                return;
+            }
+            try {
+                const arrayBuffer = await selectedFile.arrayBuffer();
+                const pdfDocument = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                setFileMetadata({
+                    name: selectedFile.name,
+                    numPages: pdfDocument.numPages,
+                    size: selectedFile.size
+                });
+            } catch (err) {
+                console.error(err);
+                toast.error('Failed to read PDF file metadata.');
+                setFile(null);
+                return;
+            }
         } else {
             if (!selectedFile.name.match(/\.(docx|doc)$/i)) {
                 toast.error('Please upload a valid Word document (.docx or .doc).');
@@ -247,12 +269,111 @@ const PdfWord = () => {
         }
     };
 
-    const handleDownload = () => {
-        if (mode === 'pdf2word') {
-            runCloudConvert();
-        } else {
-            downloadPdf();
+    const compressPdf = async () => {
+        setIsProcessing(true);
+        setProgress(0);
+        setProgressLabel('Reading PDF...');
+        
+        try {
+            const arrayBuffer = await file.arrayBuffer();
+            setProgress(10);
+            setProgressLabel('Applying compression...');
+            
+            let finalBytes = null;
+            
+            if (compressionLevel === 0) {
+                // Normal
+                const pdfDoc = await PDFDocument.load(arrayBuffer);
+                const newDoc = await PDFDocument.create();
+                const pages = await newDoc.copyPages(pdfDoc, pdfDoc.getPageIndices());
+                pages.forEach(p => newDoc.addPage(p));
+                
+                setProgress(80);
+                setProgressLabel('Finalizing output...');
+                finalBytes = await newDoc.save({ objectsPerTick: 50 });
+            } else {
+                // Moderate or Strict
+                const pdfData = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                const newDoc = await PDFDocument.create();
+                
+                const numPages = pdfData.numPages;
+                const scale = compressionLevel === 1 ? 1.5 : 1.0;
+                const quality = compressionLevel === 1 ? 0.75 : 0.40;
+                
+                for (let i = 1; i <= numPages; i++) {
+                    setProgressLabel(`Processing page ${i} of ${numPages}...`);
+                    setProgress(10 + Math.round(((i - 1) / numPages) * 70));
+                    
+                    const page = await pdfData.getPage(i);
+                    const viewport = page.getViewport({ scale });
+                    
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+                    
+                    await page.render({ canvasContext: context, viewport }).promise;
+                    
+                    const jpegDataUrl = canvas.toDataURL('image/jpeg', quality);
+                    const jpegBytes = await fetch(jpegDataUrl).then(res => res.arrayBuffer());
+                    
+                    const img = await newDoc.embedJpg(jpegBytes);
+                    const newPage = newDoc.addPage([img.width, img.height]);
+                    newPage.drawImage(img, {
+                        x: 0,
+                        y: 0,
+                        width: img.width,
+                        height: img.height,
+                    });
+                }
+                setProgress(85);
+                setProgressLabel('Finalizing output...');
+                finalBytes = await newDoc.save({ objectsPerTick: 50 });
+            }
+            
+            setProgress(100);
+            setProgressLabel('✓ Done! Downloading compressed PDF');
+            
+            if (finalBytes.length >= file.size) {
+                 toast('ℹ This PDF is already well optimized. Compression saved minimal space.', { icon: 'ℹ' });
+            }
+            
+            const originalName = file.name.replace(/\.[^/.]+$/, "");
+            const outName = `${originalName}-compressed.pdf`;
+            const blob = new Blob([finalBytes], { type: 'application/pdf' });
+            saveAs(blob, outName);
+            toast.success('✓ Compressed PDF saved');
+            
+            const originalSz = (file.size / 1024 / 1024).toFixed(2);
+            const finalSz = (finalBytes.length / 1024 / 1024).toFixed(2);
+            const saved = ((file.size - finalBytes.length) / 1024 / 1024).toFixed(2);
+            let percentage = (((file.size - finalBytes.length) / file.size) * 100).toFixed(0);
+            if (percentage < 0) percentage = 0;
+            const lvlName = compressionLevel === 0 ? 'Normal' : compressionLevel === 1 ? 'Moderate' : 'Strict';
+            
+            setCompressResult({
+                 originalSize: originalSz,
+                 finalSize: finalSz,
+                 spaceSaved: `${saved > 0 ? saved : 0} MB (${percentage}% smaller)`,
+                 level: lvlName
+            });
+            
+        } catch(error) {
+            console.error('Compression error:', error);
+            toast.error('An error occurred during compression.');
+        } finally {
+            setTimeout(() => {
+                setIsProcessing(false);
+                setProgressLabel('');
+                setProgress(0);
+            }, 2000);
         }
+    };
+
+    const handleDownload = () => {
+        if (mode === 'pdf2word') runCloudConvert();
+        else if (mode === 'word2pdf') downloadPdf();
+        else if (mode === 'compress') compressPdf();
     };
 
     const resetTool = () => {
@@ -261,6 +382,22 @@ const PdfWord = () => {
         setProgress(0);
         setProgressLabel('');
         setIsProcessing(false);
+        setCompressionLevel(0);
+        setFileMetadata(null);
+        setCompressResult(null);
+    };
+
+    const getCompressionEstimate = () => {
+        if (!fileMetadata) return null;
+        let factor = 0.45;
+        if (compressionLevel === 1) factor = 0.30;
+        if (compressionLevel === 2) factor = 0.15;
+        const estSize = fileMetadata.size * factor;
+        const reduction = ((1 - factor) * 100).toFixed(0);
+        return {
+            estimatedMB: (estSize / 1024 / 1024).toFixed(2),
+            reduction
+        };
     };
 
     return (
@@ -269,13 +406,15 @@ const PdfWord = () => {
                 <div className="max-w-4xl mx-auto">
                     <h1 className="text-2xl font-bold text-[#e8e8e8] mb-2 flex items-center gap-2">
                         <FileEdit className="text-[#00ff88]" />
-                        PDF & Word
+                        {mode === 'compress' ? 'Compress PDF' : 'PDF & Word'}
                     </h1>
                     <p className="text-[#666666] text-sm flex items-center gap-2">
-                        Convert between PDF and Word documents directly in your browser.
+                        {mode === 'compress' ? 'Reduce the file size of your PDF documents easily.' : 'Convert between PDF and Word documents directly in your browser.'}
                     </p>
                     <div className="mt-2 text-xs font-mono text-[#00ff88] bg-[#00ff88]/10 w-max px-2 py-1 rounded">
-                        {mode === 'pdf2word' ? 'Input PDF → Output DOCX' : 'Input DOCX · DOC → Output PDF'}
+                        {mode === 'pdf2word' && '📥 Input: PDF → 📤 Output: DOCX'}
+                        {mode === 'word2pdf' && '📥 Input: DOCX · DOC → 📤 Output: PDF'}
+                        {mode === 'compress' && '📥 Input: PDF → 📤 Output: Compressed PDF (smaller file size)'}
                     </div>
                 </div>
             </div>
@@ -293,17 +432,27 @@ const PdfWord = () => {
                                 : 'bg-[#111111] text-[#666666] hover:text-[#e8e8e8] hover:bg-[#161616]'
                             }`}
                         >
-                            PDF to Word
+                            📄 PDF → Word
                         </button>
                         <button
                             onClick={() => setMode('word2pdf')}
-                            className={`flex-1 py-3 text-sm font-medium transition-colors ${
+                            className={`flex-1 py-3 text-sm font-medium transition-colors border-x border-[#1a1a1a] ${
                                 mode === 'word2pdf' 
                                 ? 'bg-[#00ff88] text-black' 
                                 : 'bg-[#111111] text-[#666666] hover:text-[#e8e8e8] hover:bg-[#161616]'
                             }`}
                         >
-                            Word to PDF
+                            📝 Word → PDF
+                        </button>
+                        <button
+                            onClick={() => setMode('compress')}
+                            className={`flex-1 py-3 text-sm font-medium transition-colors ${
+                                mode === 'compress' 
+                                ? 'bg-[#00ff88] text-black' 
+                                : 'bg-[#111111] text-[#666666] hover:text-[#e8e8e8] hover:bg-[#161616]'
+                            }`}
+                        >
+                            🗜 Compress PDF
                         </button>
                     </div>
 
@@ -330,7 +479,7 @@ const PdfWord = () => {
                         <div className="border-2 border-dashed border-[#1a1a1a] rounded-lg p-12 text-center hover:border-[#00ff88] transition-colors relative group bg-[#0a0a0a]">
                             <input
                                 type="file"
-                                accept={mode === 'pdf2word' ? "application/pdf" : ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+                                accept={mode === 'pdf2word' || mode === 'compress' ? "application/pdf" : ".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
                                 onChange={handleFileChange}
                                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                             />
@@ -340,7 +489,7 @@ const PdfWord = () => {
                                 </div>
                                 <div>
                                     <p className="text-[#e8e8e8] font-medium mb-1">
-                                        Drop your {mode === 'pdf2word' ? 'PDF' : 'Word'} document here
+                                        Drop your {mode === 'word2pdf' ? 'Word' : 'PDF'} document here
                                     </p>
                                     <p className="text-[#666666] text-sm">
                                         or click to browse from your computer
@@ -350,6 +499,8 @@ const PdfWord = () => {
                         </div>
                     ) : (
                         <div className="space-y-6">
+                            
+                            {/* File Status Header */}
                             <div className="bg-[#111111] rounded-lg p-6 flex flex-col md:flex-row items-center justify-between gap-4 border border-[#1a1a1a]">
                                 <div className="flex items-center gap-4 text-[#e8e8e8]">
                                     <div className="w-12 h-12 rounded bg-[#1a1a1a] flex items-center justify-center text-[#00ff88]">
@@ -359,35 +510,160 @@ const PdfWord = () => {
                                         <h3 className="font-medium truncate max-w-[200px] md:max-w-md" title={file.name}>
                                             {file.name}
                                         </h3>
-                                        <p className="text-[#666666] text-sm">
-                                            {(file.size / 1024 / 1024).toFixed(2)} MB
-                                        </p>
+                                        {mode !== 'compress' && (
+                                            <p className="text-[#666666] text-sm">
+                                                {(file.size / 1024 / 1024).toFixed(2)} MB
+                                            </p>
+                                        )}
+                                        {mode === 'compress' && fileMetadata && (
+                                            <div className="mt-1 flex flex-wrap gap-2">
+                                                 <span className="bg-[#1a1a1a] px-2 py-0.5 rounded text-[10px] text-[#e8e8e8] font-mono border border-[#333]">{fileMetadata.numPages} pages</span>
+                                                 <span className="bg-[#1a1a1a] px-2 py-0.5 rounded text-[10px] text-[#e8e8e8] font-mono border border-[#333]">{(fileMetadata.size / 1024 / 1024).toFixed(2)} MB</span>
+                                            </div>
+                                        )}
                                     </div>
                                 </div>
 
-                                <div className="flex gap-2 w-full md:w-auto">
+                                {/* Common actions if not compress result */}
+                                {(!compressResult) && (
+                                    <div className="flex gap-2 w-full md:w-auto">
+                                        <button
+                                            onClick={resetTool}
+                                            disabled={isProcessing}
+                                            className="flex-1 md:flex-none p-3 rounded bg-[#1a1a1a] text-[#e8e8e8] hover:bg-[#222222] transition-colors disabled:opacity-50 flex items-center justify-center"
+                                            title="Start Over"
+                                        >
+                                            <RefreshCw size={20} className={isProcessing && progress > 0 && progress < 100 ? "animate-spin" : ""} />
+                                        </button>
+                                        
+                                        {mode !== 'compress' && (
+                                            <button
+                                                onClick={handleDownload}
+                                                disabled={(mode === 'word2pdf' && !previewContent) || isProcessing}
+                                                className="flex-1 md:flex-none px-6 py-3 rounded bg-[#00ff88] text-black font-medium hover:bg-[#00e67a] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                            >
+                                                {isProcessing ? (
+                                                    <RefreshCw size={20} className="animate-spin" />
+                                                ) : (
+                                                    <Download size={20} />
+                                                )}
+                                                {mode === 'pdf2word' ? 'Convert & Download DOCX' : 'Download PDF'}
+                                            </button>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Compress Dashboard */}
+                            {mode === 'compress' && !compressResult && (
+                                <div className="mt-6 space-y-6">
+                                    <div className="bg-[#111111] rounded-lg p-6 border border-[#1a1a1a]">
+                                        <div className="text-center mb-8">
+                                            <h3 className="text-2xl font-bold text-[#00ff88]">
+                                                {compressionLevel === 0 ? 'Normal Compression' : compressionLevel === 1 ? 'Moderate Compression' : 'Strict Compression'}
+                                            </h3>
+                                            <p className="text-[#a0a0a0] text-sm mt-2 max-w-lg mx-auto">
+                                                {compressionLevel === 0 && 'Reduces file size with no visible quality loss. Recommended for most files.'}
+                                                {compressionLevel === 1 && 'Noticeably smaller file with slight reduction in image sharpness.'}
+                                                {compressionLevel === 2 && 'Maximum compression. Text and images may appear degraded.'}
+                                            </p>
+                                        </div>
+
+                                        <div className="px-6 mb-8 max-w-2xl mx-auto">
+                                            <input 
+                                                type="range" 
+                                                min="0" max="2" step="1" 
+                                                value={compressionLevel}
+                                                onChange={(e) => setCompressionLevel(parseInt(e.target.value))}
+                                                className="w-full h-2 bg-[#2a2a2a] rounded-lg appearance-none cursor-pointer accent-[#00ff88]"
+                                            />
+                                            <div className="flex justify-between text-xs text-[#888888] font-medium mt-3 px-1">
+                                                <span className="w-16 text-left -translate-x-1/2">Normal</span>
+                                                <span className="w-16 text-center">Moderate</span>
+                                                <span className="w-16 text-right translate-x-1/2">Strict</span>
+                                            </div>
+                                        </div>
+
+                                        {compressionLevel === 2 && (
+                                            <div className="bg-[#1a1500] border-l-4 border-yellow-400 p-4 rounded mb-6 max-w-2xl mx-auto">
+                                                <div className="flex items-start gap-3">
+                                                    <AlertCircle className="text-yellow-400 flex-shrink-0 mt-0.5" size={18} />
+                                                    <div>
+                                                        <h4 className="text-yellow-400 font-medium text-sm">Strict Compression Warning</h4>
+                                                        <p className="text-[#a0a0a0] text-xs mt-1 leading-relaxed">This level applies maximum compression and may significantly reduce the quality of text, images, and formatting in your PDF. Only use this if file size is the top priority over quality.</p>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <div className="bg-[#0a0a0a] rounded-lg p-5 border border-[#1a1a1a] font-mono text-sm max-w-2xl mx-auto">
+                                            <div className="flex justify-between mb-3 pb-3 border-b border-[#1a1a1a] border-dashed">
+                                                <span className="text-[#666666]">Original:</span>
+                                                <span className="text-[#e8e8e8]">{fileMetadata ? (fileMetadata.size / 1024 / 1024).toFixed(2) : '0'} MB</span>
+                                            </div>
+                                            <div className="flex justify-between items-center">
+                                                <span className="text-[#666666]">Estimated:</span>
+                                                <div className="flex items-center gap-3">
+                                                    <span className="text-[#e8e8e8] font-bold">~{getCompressionEstimate()?.estimatedMB} MB</span>
+                                                    <span className="bg-[#00ff88]/10 text-[#00ff88] px-2 py-0.5 rounded text-xs border border-[#00ff88]/20">-{getCompressionEstimate()?.reduction}%</span>
+                                                </div>
+                                            </div>
+                                            <div className="text-[10px] text-[#444444] mt-4 text-right italic font-sans">
+                                                * Actual size may vary based on PDF content
+                                            </div>
+                                        </div>
+                                        
+                                        <div className="flex justify-center mt-8">
+                                            <button
+                                                onClick={handleDownload}
+                                                disabled={isProcessing}
+                                                className="w-full max-w-md py-4 rounded bg-[#00ff88] text-black font-bold tracking-wide hover:bg-[#00e67a] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-3"
+                                            >
+                                                {isProcessing ? (
+                                                    <RefreshCw size={22} className="animate-spin" />
+                                                ) : (
+                                                    <Download size={22} />
+                                                )}
+                                                Compress & Download PDF
+                                            </button>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Compress Result Card */}
+                            {mode === 'compress' && compressResult && (
+                                <div className="mt-8 bg-[#0a0a0a] p-6 md:p-8 rounded-lg border border-[#00ff88]/30 font-mono text-sm shadow-[0_0_20px_rgba(0,255,136,0.05)] mx-auto max-w-2xl">
+                                    <div className="flex items-center justify-center gap-3 text-[#00ff88] text-xl font-bold mb-8">
+                                        <CheckCircle size={28} />
+                                        Compression Complete
+                                    </div>
+                                    <div className="space-y-4 mb-8 text-[#e8e8e8]">
+                                        <div className="flex justify-between items-center pb-4 border-b border-[#1a1a1a]">
+                                            <span className="text-[#666666]">Original size</span>
+                                            <span className="text-lg">{compressResult.originalSize} MB</span>
+                                        </div>
+                                        <div className="flex justify-between items-center pb-4 border-b border-[#1a1a1a]">
+                                            <span className="text-[#666666]">Compressed size</span>
+                                            <span className="text-lg">{compressResult.finalSize} MB</span>
+                                        </div>
+                                        <div className="flex justify-between items-center pb-4 border-b border-[#1a1a1a]">
+                                            <span className="text-[#00ff88] font-bold">Space saved</span>
+                                            <span className="text-[#00ff88] font-bold text-lg">{compressResult.spaceSaved}</span>
+                                        </div>
+                                        <div className="flex justify-between items-center pt-2">
+                                            <span className="text-[#666666]">Level used</span>
+                                            <span className="bg-[#111111] px-3 py-1 rounded text-[#e8e8e8]">{compressResult.level}</span>
+                                        </div>
+                                    </div>
                                     <button
                                         onClick={resetTool}
-                                        disabled={isProcessing}
-                                        className="flex-1 md:flex-none p-3 rounded bg-[#1a1a1a] text-[#e8e8e8] hover:bg-[#222222] transition-colors disabled:opacity-50 flex items-center justify-center"
-                                        title="Start Over"
-                                    >
-                                        <RefreshCw size={20} className={isProcessing && progress > 0 && progress < 100 ? "animate-spin" : ""} />
-                                    </button>
-                                    <button
-                                        onClick={handleDownload}
-                                        disabled={(mode === 'word2pdf' && !previewContent) || isProcessing}
-                                        className="flex-1 md:flex-none px-6 py-3 rounded bg-[#00ff88] text-black font-medium hover:bg-[#00e67a] transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                                    >
-                                        {isProcessing ? (
-                                            <RefreshCw size={20} className="animate-spin" />
-                                        ) : (
-                                            <Download size={20} />
-                                        )}
-                                        {mode === 'pdf2word' ? 'Convert & Download DOCX' : 'Download PDF'}
+                                        className="w-full py-3 hover:bg-[#111111] rounded text-[#e8e8e8] font-sans font-medium text-sm transition-colors border border-[#2a2a2a]"
+                                    >   
+                                        Compress Another PDF
                                     </button>
                                 </div>
-                            </div>
+                            )}
 
                             {/* Progress Section */}
                             {(isProcessing || (progress > 0 && progress < 100)) && (
@@ -405,33 +681,35 @@ const PdfWord = () => {
                                 </div>
                             )}
 
-                            {/* Disclaimers */}
-                            <div className="flex flex-col gap-1 items-center justify-center text-center">
-                                {mode === 'pdf2word' ? (
-                                    <>
-                                        <p className="text-[#666666] text-xs flex items-center gap-1">
-                                            <AlertCircle size={12} />
-                                            🔒 Your file is sent to CloudConvert for conversion and immediately
-                                        </p>
-                                        <p className="text-[#666666] text-xs">
-                                            deleted from their servers after download. No data is stored.
-                                        </p>
-                                        <p className="text-[#666666] text-xs mt-1 font-medium">
-                                            Free tier allows 250 conversions per month.
-                                        </p>
-                                    </>
-                                ) : (
-                                    <>
-                                        <p className="text-[#666666] text-xs flex items-center gap-1">
-                                            <AlertCircle size={12} />
-                                            Client-side conversion preserves text and basic formatting.
-                                        </p>
-                                        <p className="text-[#666666] text-xs">
-                                            Complex layouts, tables, and images may not be fully preserved.
-                                        </p>
-                                    </>
-                                )}
-                            </div>
+                            {/* Disclaimers (Not shown in compress mode unless stated) */}
+                            {mode !== 'compress' && (
+                                <div className="flex flex-col gap-1 items-center justify-center text-center">
+                                    {mode === 'pdf2word' ? (
+                                        <>
+                                            <p className="text-[#666666] text-xs flex items-center gap-1">
+                                                <AlertCircle size={12} />
+                                                🔒 Your file is sent to CloudConvert for conversion and immediately
+                                            </p>
+                                            <p className="text-[#666666] text-xs">
+                                                deleted from their servers after download. No data is stored.
+                                            </p>
+                                            <p className="text-[#666666] text-xs mt-1 font-medium">
+                                                Free tier allows 250 conversions per month.
+                                            </p>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <p className="text-[#666666] text-xs flex items-center gap-1">
+                                                <AlertCircle size={12} />
+                                                Client-side conversion preserves text and basic formatting.
+                                            </p>
+                                            <p className="text-[#666666] text-xs">
+                                                Complex layouts, tables, and images may not be fully preserved.
+                                            </p>
+                                        </>
+                                    )}
+                                </div>
+                            )}
 
                             {/* Preview Area (Word to PDF only) */}
                             {mode === 'word2pdf' && previewContent && (
