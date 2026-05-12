@@ -1,5 +1,5 @@
-import { useState, useCallback } from 'react';
-import { Download, FileArchive, Trash2, ArrowRight } from 'lucide-react';
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { Download, FileArchive, Trash2, ArrowRight, Repeat } from 'lucide-react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import DropZone from '../components/DropZone';
@@ -9,6 +9,8 @@ const FORMATS = [
     { id: 'jpeg', label: 'JPG', mime: 'image/jpeg' },
     { id: 'png', label: 'PNG', mime: 'image/png' },
     { id: 'webp', label: 'WebP', mime: 'image/webp' },
+    { id: 'gif', label: 'GIF', mime: 'image/gif' },
+    { id: 'bmp', label: 'BMP', mime: 'image/bmp' },
 ];
 
 export default function ConvertFormat() {
@@ -16,6 +18,19 @@ export default function ConvertFormat() {
     const [outputFormat, setOutputFormat] = useState(FORMATS[1]); // Default PNG
     const [quality, setQuality] = useState(90);
     const [processing, setProcessing] = useState(false);
+
+    const filesRef = useRef(files);
+    useEffect(() => {
+        filesRef.current = files;
+    }, [files]);
+
+    useEffect(() => {
+        return () => {
+            filesRef.current.forEach(f => {
+                if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+            });
+        };
+    }, []);
 
     const handleFiles = (newFiles) => {
         const validFiles = newFiles.filter(f => f.type.startsWith('image/'));
@@ -27,9 +42,10 @@ export default function ConvertFormat() {
             const fileObjects = validFiles.map(f => ({
                 id: crypto.randomUUID(),
                 file: f,
-                originalUrl: URL.createObjectURL(f),
+                previewUrl: URL.createObjectURL(f),
                 status: 'pending', // pending, processing, done, error
                 resultBlob: null,
+                errorMsg: '',
             }));
             setFiles(prev => [...prev, ...fileObjects]);
         }
@@ -39,56 +55,98 @@ export default function ConvertFormat() {
         setFiles(prev => {
             const remaining = prev.filter(f => f.id !== id);
             const removed = prev.find(f => f.id === id);
-            if (removed && removed.originalUrl) URL.revokeObjectURL(removed.originalUrl);
+            if (removed && removed.previewUrl) URL.revokeObjectURL(removed.previewUrl);
             return remaining;
         });
     };
 
     const processFile = async (fileObj) => {
-        return new Promise((resolve) => {
-            const img = new Image();
-            img.onload = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = img.width;
-                canvas.height = img.height;
-                const ctx = canvas.getContext('2d');
+        return new Promise((resolve, reject) => {
+            try {
+                const img = new Image();
+                const tempUrl = URL.createObjectURL(fileObj.file);
+                
+                img.onload = () => {
+                    try {
+                        const canvas = document.createElement('canvas');
+                        canvas.width = img.naturalWidth;
+                        canvas.height = img.naturalHeight;
+                        
+                        if (canvas.width === 0 || canvas.height === 0) {
+                            throw new Error('Invalid image dimensions');
+                        }
 
-                // Fill white background for formats that don't support transparency like JPG 
-                if (outputFormat.mime === 'image/jpeg') {
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fillRect(0, 0, canvas.width, canvas.height);
-                }
+                        const ctx = canvas.getContext('2d');
 
-                ctx.drawImage(img, 0, 0);
+                        if (outputFormat.mime === 'image/jpeg') {
+                            ctx.fillStyle = '#ffffff';
+                            ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        }
 
-                canvas.toBlob((blob) => {
-                    resolve(blob);
-                }, outputFormat.mime, quality / 100);
-            };
-            img.onerror = () => resolve(null);
-            img.src = fileObj.originalUrl;
+                        ctx.drawImage(img, 0, 0);
+
+                        let exportMime = outputFormat.mime;
+                        if (exportMime === 'image/gif' || exportMime === 'image/bmp') {
+                            exportMime = 'image/png';
+                        }
+
+                        const args = [exportMime];
+                        if (exportMime === 'image/jpeg' || exportMime === 'image/webp') {
+                            args.push(quality / 100);
+                        }
+
+                        canvas.toBlob((blob) => {
+                            URL.revokeObjectURL(tempUrl);
+                            if (blob) {
+                                resolve(blob);
+                            } else {
+                                reject(new Error('unsupported'));
+                            }
+                        }, ...args);
+                    } catch (err) {
+                        URL.revokeObjectURL(tempUrl);
+                        reject(err);
+                    }
+                };
+                
+                img.onerror = () => {
+                    URL.revokeObjectURL(tempUrl);
+                    reject(new Error('load_failed'));
+                };
+                
+                img.src = tempUrl;
+            } catch (err) {
+                reject(err);
+            }
         });
     };
 
     const handleConvertAll = async () => {
         setProcessing(true);
-        const updatedFiles = [...files];
+        const updatedFiles = [...filesRef.current];
 
         for (let i = 0; i < updatedFiles.length; i++) {
             if (updatedFiles[i].status === 'done') continue;
 
             updatedFiles[i] = { ...updatedFiles[i], status: 'processing' };
-            setFiles([...updatedFiles]); // trigger re-render for processing state
+            setFiles([...updatedFiles]);
 
-            const blob = await processFile(updatedFiles[i]);
-
-            if (blob) {
+            try {
+                const blob = await processFile(updatedFiles[i]);
                 updatedFiles[i] = { ...updatedFiles[i], status: 'done', resultBlob: blob };
-            } else {
-                updatedFiles[i] = { ...updatedFiles[i], status: 'error' };
+            } catch (err) {
+                let errorMsg = `⚠ Could not convert ${updatedFiles[i].file.name} — unsupported format`;
+                if (err.message === 'load_failed') {
+                    errorMsg = '✗ Failed to load';
+                } else if (err.message === 'unsupported') {
+                    errorMsg = '⚠ Format not supported in this browser';
+                }
+                updatedFiles[i] = { ...updatedFiles[i], status: 'error', errorMsg };
                 notify.error(`Failed to process ${updatedFiles[i].file.name}`);
             }
             setFiles([...updatedFiles]);
+            
+            await new Promise(r => setTimeout(r, 300));
         }
 
         setProcessing(false);
@@ -147,7 +205,16 @@ export default function ConvertFormat() {
                     <span className="text-accent">→</span>
                     <span className="bg-surface border border-border px-2 py-1 rounded">📤 Output: JPG · PNG · WebP · GIF · BMP</span>
                 </div>
-                <p className="text-xs font-mono text-subtle mb-4">⚠ GIF output is static (canvas export limitation)</p>
+                {outputFormat.id === 'gif' && (
+                    <p className="text-xs font-mono text-yellow-400 mb-4 bg-yellow-400/10 inline-block px-2 py-1 rounded border border-yellow-400/20">
+                        ℹ GIF export uses PNG encoding — animated GIFs are not supported in browser-based conversion
+                    </p>
+                )}
+                {outputFormat.id === 'bmp' && (
+                    <p className="text-xs font-mono text-yellow-400 mb-4 bg-yellow-400/10 inline-block px-2 py-1 rounded border border-yellow-400/20">
+                        ℹ BMP export uses PNG encoding in browser environment
+                    </p>
+                )}
             </div>
 
             <DropZone
@@ -265,7 +332,7 @@ export default function ConvertFormat() {
                                         <tr key={f.id} className="hover:bg-bg/50 transition-colors group">
                                             <td className="p-4">
                                                 <div className="flex items-center gap-3">
-                                                    <img src={f.originalUrl} alt="" className="w-10 h-10 object-cover rounded bg-bg border border-border" />
+                                                    <img src={f.previewUrl} alt="" className="w-10 h-10 object-cover rounded bg-bg border border-border" />
                                                     <span className="font-mono text-sm block truncate max-w-[200px]" title={f.file.name}>
                                                         {f.file.name}
                                                     </span>
@@ -279,8 +346,8 @@ export default function ConvertFormat() {
                                             <td className="p-4">
                                                 {f.status === 'pending' && <span className="text-xs font-mono text-subtle">Ready</span>}
                                                 {f.status === 'processing' && <span className="text-xs font-mono text-[#e8e8e8] animate-pulse">Processing...</span>}
-                                                {f.status === 'done' && <span className="text-xs font-mono text-accent">Done</span>}
-                                                {f.status === 'error' && <span className="text-xs font-mono text-red-400">Error</span>}
+                                                {f.status === 'done' && <span className="text-xs font-mono text-[#00ff88]">✓ Converted</span>}
+                                                {f.status === 'error' && <span className="text-xs font-mono text-red-400">{f.errorMsg || '✗ Failed'}</span>}
                                             </td>
                                             <td className="p-4 flex gap-2">
                                                 {f.status === 'done' ? (
